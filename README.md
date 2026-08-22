@@ -221,6 +221,27 @@ Projects with a custom build setup (CMake presets, cross-compilation toolchains,
 
 New files are searchable immediately even before any reconfigure: the daemon opens freshly created source files in clangd directly, which infers their compile flags from neighboring files. The auto-reconfigure exists to restore the authoritative compile_commands.json afterwards, not to make new files visible.
 
+### Example: CMake Presets with Globbed Sources
+
+A typical setup: the project globs its sources and configures through a preset, with the compilation database landing in `build/`:
+
+```cmake
+# CMakeLists.txt
+file(GLOB_RECURSE armillary_src CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc)
+add_executable(armillary ${armillary_src})
+```
+
+```json
+{
+  "compileCommands": "build/compile_commands.json",
+  "generate": "cmake --preset local",
+  "autoReconfigure": true
+}
+```
+
+With this in place, the daemon reuses `build/compile_commands.json` from your own `cmake --preset local` runs instead of configuring its own build directory. When you (or an agent) add or delete a `.cc` file under `src/`, the new file's symbols are searchable right away, and about 30 seconds after the file operations settle the daemon re-runs `cmake --preset local` so the compilation database reflects the new file set. clangd picks up the regenerated database by itself.
+
 All fields are optional and independent, except that `generate` requires `compileCommands`. Without a configuration file the built-in behavior applies (see Compilation Database below). Editing the file while the daemon is running is safe: the next command detects the change and restarts the daemon automatically. A malformed file is a hard error rather than a silent fallback to defaults.
 
 The configuration file also acts as a project root marker: when searching ancestor directories for the project root, the first directory containing `.clangd-query.json` or `CMakeLists.txt` wins. A non-CMake project can therefore be served purely from a configuration file.
