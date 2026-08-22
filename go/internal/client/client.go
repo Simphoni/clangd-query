@@ -60,6 +60,8 @@ type ErrorResponse struct {
 type StatusInfo struct {
 	PID           int    `json:"pid"`
 	ProjectRoot   string `json:"projectRoot"`
+	BuildDir      string `json:"buildDir"`
+	IndexDir      string `json:"indexDir"`
 	Uptime        string `json:"uptime"`
 	TotalRequests int    `json:"totalRequests"`
 	Connections   int    `json:"connections"`
@@ -274,8 +276,9 @@ func (c *Client) handleCommand(config *Config) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Daemon Status:\n  PID: %d\n  Project: %s\n  Uptime: %s\n  Requests: %d\n  Connections: %d\n",
-			status.PID, status.ProjectRoot, status.Uptime, status.TotalRequests, status.Connections), nil
+		return fmt.Sprintf("Daemon Status:\n  PID: %d\n  Project: %s\n  Build Dir: %s\n  Index Dir: %s\n  Uptime: %s\n  Requests: %d\n  Connections: %d\n",
+			status.PID, status.ProjectRoot, status.BuildDir, status.IndexDir,
+			status.Uptime, status.TotalRequests, status.Connections), nil
 
 	case "shutdown":
 		if err := c.Shutdown(); err != nil {

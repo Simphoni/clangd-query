@@ -25,6 +25,7 @@ type Config struct {
 // Daemon manages the clangd process and handles client connections
 type Daemon struct {
 	projectRoot   string
+	buildDir      string
 	socketPath    string
 	logger        logger.Logger
 	clangdClient  *clangd.ClangdClient
@@ -114,6 +115,7 @@ func Run(config *Config) {
 		daemon.logger.Error("Failed to find compilation database: %v", err)
 		os.Exit(1)
 	}
+	daemon.buildDir = buildDir
 
 	// When the project now uses a configured compilation database, the old
 	// private build directory left behind by a previous zero-config run is
@@ -422,6 +424,8 @@ func (d *Daemon) handleStatus() (json.RawMessage, error) {
 	status := map[string]interface{}{
 		"pid":           os.Getpid(),
 		"projectRoot":   d.projectRoot,
+		"buildDir":      d.buildDir,
+		"indexDir":      filepath.Join(d.buildDir, ".cache", "clangd"),
 		"uptime":        time.Since(d.startTime).String(),
 		"totalRequests": d.totalRequests,
 		"connections":   d.connections,
