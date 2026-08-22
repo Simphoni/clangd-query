@@ -28,6 +28,7 @@ type ClangdClient struct {
 	buildDir      string
 	indexingDone  chan struct{}
 	isIndexing    bool
+	indexingSince time.Time
 	indexingMu    sync.RWMutex
 	openDocuments map[string]bool
 	docMu         sync.RWMutex
@@ -238,6 +239,7 @@ func (c *ClangdClient) initialize() error {
 	// Mark indexing as started
 	c.indexingMu.Lock()
 	c.isIndexing = true
+	c.indexingSince = time.Now()
 	c.indexingMu.Unlock()
 
 	// Open first source file to trigger indexing
@@ -325,6 +327,21 @@ func (c *ClangdClient) WaitForIndexing() {
 		// The fallback also closes indexingDone, but this timeout keeps the
 		// wait bounded even if a future code path misses the signal.
 	}
+}
+
+// IndexingStatus reports whether the initial background index has finished,
+// together with how long indexing has been running. It never blocks, which
+// lets the daemon answer clients immediately with a "still indexing" signal
+// instead of holding the request open until clangd is ready.
+func (c *ClangdClient) IndexingStatus() (done bool, elapsed time.Duration) {
+	c.indexingMu.RLock()
+	defer c.indexingMu.RUnlock()
+
+	done = !c.isIndexing
+	if !c.indexingSince.IsZero() {
+		elapsed = time.Since(c.indexingSince)
+	}
+	return done, elapsed
 }
 
 // Returns how long the daemon waits for clangd's initial background index.

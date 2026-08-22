@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -59,6 +60,24 @@ type Response struct {
 type ErrorResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// Error code sent when a client asks for code intelligence before clangd has
+// finished building its initial background index. The client recognizes this
+// code and retries the same request instead of treating it as a failure.
+const ErrorCodeStillIndexing = 1000
+
+// StillIndexingError indicates that the daemon answered a command without
+// executing it because clangd's initial indexing is still in progress.
+// handleConnection maps this type to ErrorCodeStillIndexing so the client can
+// distinguish a normal, expected wait from a real daemon failure.
+type StillIndexingError struct {
+	Elapsed time.Duration
+}
+
+// Error formats the wait state for both logs and the client's stderr output.
+func (e *StillIndexingError) Error() string {
+	return fmt.Sprintf("still indexing (elapsed %s)", e.Elapsed.Round(time.Second))
 }
 
 // Run starts the daemon
@@ -348,9 +367,17 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		}
 
 		if err != nil {
-			resp.Error = &ErrorResponse{
-				Code:    -1,
-				Message: err.Error(),
+			var indexingErr *StillIndexingError
+			if errors.As(err, &indexingErr) {
+				resp.Error = &ErrorResponse{
+					Code:    ErrorCodeStillIndexing,
+					Message: indexingErr.Error(),
+				}
+			} else {
+				resp.Error = &ErrorResponse{
+					Code:    -1,
+					Message: err.Error(),
+				}
 			}
 		} else {
 			resp.Result = result
@@ -379,7 +406,14 @@ func (d *Daemon) handleRequest(req Request) (json.RawMessage, error) {
 		return json.Marshal(map[string]string{"status": "shutting down"})
 	}
 
-	// All other commands go to clangd
+	// All other commands go to clangd. If initial indexing is still running,
+	// answer immediately with a still-indexing response rather than blocking
+	// the request for what may be minutes. The client handles that response
+	// by printing progress and retrying.
+	if done, elapsed := d.clangdClient.IndexingStatus(); !done {
+		return nil, &StillIndexingError{Elapsed: elapsed}
+	}
+
 	input, _ := req.Params["symbol"].(string)
 
 	limit := -1
@@ -421,11 +455,19 @@ func (d *Daemon) handleStatus() (json.RawMessage, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	indexingDone := true
+	var indexElapsed time.Duration
+	if d.clangdClient != nil {
+		indexingDone, indexElapsed = d.clangdClient.IndexingStatus()
+	}
+
 	status := map[string]interface{}{
 		"pid":           os.Getpid(),
 		"projectRoot":   d.projectRoot,
 		"buildDir":      d.buildDir,
 		"indexDir":      filepath.Join(d.buildDir, ".cache", "clangd"),
+		"indexing":      !indexingDone,
+		"indexElapsed":  indexElapsed.Round(time.Second).String(),
 		"uptime":        time.Since(d.startTime).String(),
 		"totalRequests": d.totalRequests,
 		"connections":   d.connections,

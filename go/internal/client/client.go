@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -56,12 +57,31 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+// ErrorCodeStillIndexing mirrors the daemon's special error code for requests
+// that arrive before clangd has finished its initial indexing. See RPCError.
+const ErrorCodeStillIndexing = 1000
+
+// RPCError preserves the numeric error code returned by the daemon. Plain
+// errors discard the code, which would make it impossible to distinguish an
+// expected "still indexing" response from a real failure.
+type RPCError struct {
+	Code    int
+	Message string
+}
+
+// Error returns the daemon-provided message.
+func (e *RPCError) Error() string {
+	return e.Message
+}
+
 // StatusInfo represents daemon status
 type StatusInfo struct {
 	PID           int    `json:"pid"`
 	ProjectRoot   string `json:"projectRoot"`
 	BuildDir      string `json:"buildDir"`
 	IndexDir      string `json:"indexDir"`
+	Indexing      bool   `json:"indexing"`
+	IndexElapsed  string `json:"indexElapsed"`
 	Uptime        string `json:"uptime"`
 	TotalRequests int    `json:"totalRequests"`
 	Connections   int    `json:"connections"`
@@ -113,7 +133,7 @@ func (c *Client) CallRPC(method string, params map[string]interface{}, opts *RPC
 
 	// Check for error
 	if resp.Error != nil {
-		return nil, fmt.Errorf("%s", resp.Error.Message)
+		return nil, &RPCError{Code: resp.Error.Code, Message: resp.Error.Message}
 	}
 
 	return resp.Result, nil
@@ -128,14 +148,53 @@ func (c *Client) CallTyped(method string, params map[string]interface{}, result 
 	return json.Unmarshal(raw, result)
 }
 
-// callCommand is a generic helper for commands that return formatted strings
+// callCommand is a generic helper for commands that return formatted strings.
+// It handles the daemon's still-indexing response by printing progress to
+// stderr and retrying until the initial background index is ready, within a
+// generous overall budget. The command's normal output still goes to stdout.
 func (c *Client) callCommand(method string, params map[string]interface{}) (string, error) {
-	var result map[string]string
-	err := c.CallTyped(method, params, &result)
-	if err != nil {
+	deadline := time.Now().Add(indexWaitTimeout())
+
+	for {
+		var result map[string]string
+		err := c.CallTyped(method, params, &result)
+		if err == nil {
+			return result["output"], nil
+		}
+
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == ErrorCodeStillIndexing {
+			if time.Now().After(deadline) {
+				return "", fmt.Errorf("clangd indexing did not finish within %s; results may be incomplete", indexWaitTimeout())
+			}
+			fmt.Fprintf(os.Stderr, "clangd %s; waiting %s...\n", rpcErr.Message, indexPollInterval())
+			time.Sleep(indexPollInterval())
+			continue
+		}
+
 		return "", err
 	}
-	return result["output"], nil
+}
+
+// Returns how long the client retries a command while the daemon reports
+// "still indexing". It mirrors the daemon-side CLANGD_INDEX_TIMEOUT fallback.
+func indexWaitTimeout() time.Duration {
+	if value := os.Getenv("CLANGD_INDEX_TIMEOUT"); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return 5 * time.Minute
+}
+
+// Returns how long the client sleeps between still-indexing retries.
+func indexPollInterval() time.Duration {
+	if value := os.Getenv("CLANGD_INDEX_POLL_INTERVAL"); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return 3 * time.Second
 }
 
 // Search searches for symbols
@@ -276,9 +335,13 @@ func (c *Client) handleCommand(config *Config) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Daemon Status:\n  PID: %d\n  Project: %s\n  Build Dir: %s\n  Index Dir: %s\n  Uptime: %s\n  Requests: %d\n  Connections: %d\n",
+		indexing := "no"
+		if status.Indexing {
+			indexing = "yes"
+		}
+		return fmt.Sprintf("Daemon Status:\n  PID: %d\n  Project: %s\n  Build Dir: %s\n  Index Dir: %s\n  Indexing: %s\n  Index Elapsed: %s\n  Uptime: %s\n  Requests: %d\n  Connections: %d\n",
 			status.PID, status.ProjectRoot, status.BuildDir, status.IndexDir,
-			status.Uptime, status.TotalRequests, status.Connections), nil
+			indexing, status.IndexElapsed, status.Uptime, status.TotalRequests, status.Connections), nil
 
 	case "shutdown":
 		if err := c.Shutdown(); err != nil {
