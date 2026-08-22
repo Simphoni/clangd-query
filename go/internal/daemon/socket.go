@@ -20,6 +20,13 @@ type LockInfo struct {
 	SocketPath  string `json:"socketPath"`
 	BuildTime   int64  `json:"buildTime"`
 	ProjectRoot string `json:"projectRoot"`
+
+	// Modification time of the project's .clangd-query.json at daemon
+	// startup, or 0 when the project has no configuration file. The daemon
+	// reads the configuration only once at startup, so clients compare this
+	// value against the file's current mtime to detect configuration
+	// changes and restart the daemon to pick them up.
+	ConfigMTime int64 `json:"configMTime"`
 }
 
 // Returns the Unix domain socket path for a given project directory.
@@ -73,6 +80,7 @@ func WriteLockFile(projectRoot string, pid int, socketPath string) error {
 		SocketPath:  socketPath,
 		BuildTime:   stat.ModTime().Unix(),
 		ProjectRoot: projectRoot,
+		ConfigMTime: ConfigMTime(projectRoot),
 	}
 
 	data, err := json.MarshalIndent(lockInfo, "", "  ")
@@ -119,6 +127,22 @@ func RemoveLockFile(projectRoot string) error {
 	return nil
 }
 
+// Removes the project's lock file only when it still belongs to the daemon
+// with the given PID. A daemon uses this during its own shutdown: between the
+// moment a client decides the daemon is stale and the moment the old daemon
+// finishes exiting, a successor daemon may already have written its own lock
+// file, and unconditionally deleting it would orphan the successor.
+func RemoveOwnLockFile(projectRoot string, pid int) error {
+	lockInfo, err := ReadLockFile(projectRoot)
+	if err != nil || lockInfo == nil {
+		return err
+	}
+	if lockInfo.PID != pid {
+		return nil
+	}
+	return RemoveLockFile(projectRoot)
+}
+
 // Checks whether a process with the given PID is still running on the system.
 // This is done by sending signal 0 to the process, which performs a permission
 // check without actually sending a signal. Returns false for invalid PIDs or
@@ -133,11 +157,13 @@ func IsProcessAlive(pid int) bool {
 	return err == nil
 }
 
-// Determines whether a running daemon needs to be restarted by checking two
-// conditions: whether the process is still alive, and whether the daemon binary
-// has been updated since the daemon started. A stale daemon should be stopped
-// and a new one started to ensure clients use the latest version.
-func IsDaemonStale(lockInfo *LockInfo) bool {
+// Determines whether a running daemon needs to be restarted. Three conditions
+// make a daemon stale: its process is gone, the clangd-query binary has been
+// updated since the daemon started, or the project's .clangd-query.json has
+// been modified, created, or deleted after the daemon loaded it. A stale
+// daemon should be stopped and a new one started to ensure clients talk to a
+// daemon running the latest code and configuration.
+func IsDaemonStale(projectRoot string, lockInfo *LockInfo) bool {
 	// Check if process is alive
 	if !IsProcessAlive(lockInfo.PID) {
 		return true
@@ -155,7 +181,13 @@ func IsDaemonStale(lockInfo *LockInfo) bool {
 	}
 
 	// If binary is newer than lock file, daemon is stale
-	return stat.ModTime().Unix() > lockInfo.BuildTime
+	if stat.ModTime().Unix() > lockInfo.BuildTime {
+		return true
+	}
+
+	// A configuration change is only visible to a freshly started daemon,
+	// since the running one loaded the old configuration at startup.
+	return ConfigMTime(projectRoot) != lockInfo.ConfigMTime
 }
 
 // Removes the Unix domain socket file from the filesystem, typically called

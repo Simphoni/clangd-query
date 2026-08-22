@@ -185,8 +185,8 @@ int GetWindowHeight() const
 
 - Go 1.21 or higher for building
 - `clangd` must be installed on your system. Version 15+ recommended for full feature support
-- CMake-based C++ project (for compile_commands.json generation).
-- Your C++ project must have `CMakeLists.txt` at the project root. The tool automatically detects your C++ project by looking for `CMakeLists.txt` in parent directories. Run `clangd-query` from anywhere within your project tree.
+- CMake-based C++ project (for compile_commands.json generation). Other build systems work through a `.clangd-query.json` configuration file, see Project Configuration below.
+- By default your C++ project must have `CMakeLists.txt` at the project root. The tool automatically detects your C++ project by looking for `CMakeLists.txt` or `.clangd-query.json` in parent directories. Run `clangd-query` from anywhere within your project tree.
 
 ## Installation
 
@@ -198,6 +198,32 @@ int GetWindowHeight() const
    ```
 4. The binary will be available at `bin/clangd-query`. Alternatively, you can use one of the prebuilt binaries in `bin/releases` (for macOS+Apple Silicon and Linux+Intel).
 5. I highly recommend creating a `clangd-query` symlink in your project root to the compiled binary, then @-link your agents to the AGENT.md file in this repository for instructions on how to use the tool.
+
+## Project Configuration
+
+Projects with a custom build setup (CMake presets, cross-compilation toolchains, non-CMake generators) can place a `.clangd-query.json` file at their root to declare how the compilation database is produced:
+
+```json
+{
+  "compileCommands": "build/compile_commands.json",
+  "generate": "cmake --preset local",
+  "clangdArgs": ["--query-driver=/usr/bin/arm-none-eabi-*"],
+  "autoReconfigure": true,
+  "reconfigureDelay": "30s"
+}
+```
+
+- `compileCommands` (string): path to your `compile_commands.json`, relative to the project root or absolute. When the file already exists it is reused as-is, so you can point the tool at the build directory you configured yourself. clangd's index is stored in `.cache/clangd` inside that file's directory.
+- `generate` (string, optional): shell command that produces the database. It runs via `sh -c` from the project root, and only when `compileCommands` does not exist yet. Regenerating an existing database is left to you: clangd watches the file and reloads changed compilation flags on its own, so re-running your configure command takes effect without restarting the daemon. Requires `compileCommands` to be set (so the daemon can verify the command's output).
+- `clangdArgs` (array of strings, optional): extra arguments appended to the clangd invocation, e.g. `--query-driver` when the compilation database references a non-host compiler.
+- `autoReconfigure` (boolean, optional): when true, the daemon watches for C++ source files being added or removed and re-runs `generate` after a quiet period, so build systems that compute their file lists dynamically (e.g. CMake's `file(GLOB_RECURSE)`) pick up the changed file set without a manual reconfigure. Requires `generate`. Note: a reconfigure writes into your build directory, so enable this only when you are not running concurrent builds in that same directory.
+- `reconfigureDelay` (string, optional): how long after the last file addition or removal `generate` is re-run, in Go duration syntax (e.g. `"30s"`, `"1m"`). Defaults to `"30s"`. Only meaningful with `autoReconfigure`.
+
+New files are searchable immediately even before any reconfigure: the daemon opens freshly created source files in clangd directly, which infers their compile flags from neighboring files. The auto-reconfigure exists to restore the authoritative compile_commands.json afterwards, not to make new files visible.
+
+All fields are optional and independent, except that `generate` requires `compileCommands`. Without a configuration file the built-in behavior applies (see Compilation Database below). Editing the file while the daemon is running is safe: the next command detects the change and restarts the daemon automatically. A malformed file is a hard error rather than a silent fallback to defaults.
+
+The configuration file also acts as a project root marker: when searching ancestor directories for the project root, the first directory containing `.clangd-query.json` or `CMakeLists.txt` wins. A non-CMake project can therefore be served purely from a configuration file.
 
 ## Other Commands
 
@@ -221,7 +247,7 @@ clangd-query --help
 
 `clangd-query` is a command-line tool and not an MCP, as agents seem to have an easier time using command-line tools. It uses a client/server architecture to make it fast and keeps output to a minimum to save tokens.
 
-On first run, `clangd-query` starts a background daemon for your project. The tool looks for `CMakeLists.txt` the current directory and all its ancestor directories. The first one it finds is used as the project root. It then creates a `compile_commands.json` from the `CMakeLists.txt` and starts `clangd` to index the codebase.
+On first run, `clangd-query` starts a background daemon for your project. The tool looks for `.clangd-query.json` or `CMakeLists.txt` in the current directory and all its ancestor directories. The first directory containing either file is used as the project root. It then ensures a `compile_commands.json` exists (see Project Configuration above for custom setups) and starts `clangd` to index the codebase. Daemon startup can take a while on a cold start; the client wait budget defaults to two minutes and can be adjusted with the `CLANGD_QUERY_STARTUP_TIMEOUT` environment variable (e.g. `30s`, `5m`).
 
 Subsequent runs of the tool are fast as the daemon is already running. The daemon shuts down automatically after 30 minutes of being idle.
 
@@ -240,10 +266,10 @@ Subsequent runs of the tool are fast as the daemon is already running. The daemo
 
 #### Compilation Database
 
-The tool will build a `compile_commands.json` from the `CMakeLists.txt`, which must be in the project root. This is used by clangd to index the codebase. The database is stored in `.cache/clangd-query/build/compile_commands.json`.
+Without a `.clangd-query.json` configuration file, the tool builds a `compile_commands.json` from the `CMakeLists.txt`, which must be in the project root. The database is stored in `.cache/clangd-query/build/compile_commands.json`. With a configuration file, the location declared by `compileCommands` is used instead.
 
 ### Index
-The clangd index is stored in `.cache/clangd-query/build/.cache/clangd`
+The clangd index is stored in a `.cache/clangd` directory inside the compilation database directory (`.cache/clangd-query/build/.cache/clangd` by default, or e.g. `build/.cache/clangd` when `compileCommands` points at `build/compile_commands.json`).
 
 ### Lock Files
 

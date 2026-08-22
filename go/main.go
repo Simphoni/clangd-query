@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 
 	"clangd-query/internal/client"
@@ -124,22 +123,6 @@ Examples:
   clangd-query hierarchy BaseClass --limit 10`)
 }
 
-func findProjectRoot(startDir string) (string, error) {
-	dir := startDir
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "CMakeLists.txt")); err == nil {
-			return dir, nil
-		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return "", fmt.Errorf("no CMakeLists.txt found in any parent directory")
-}
-
 func runDaemon(projectRoot string, verbose bool) {
 	config := &daemon.Config{
 		ProjectRoot: projectRoot,
@@ -228,7 +211,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	projectRoot, err := findProjectRoot(cwd)
+	projectRoot, err := daemon.FindProjectRoot(cwd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

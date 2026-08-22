@@ -28,6 +28,7 @@ type Daemon struct {
 	logger        logger.Logger
 	clangdClient  *clangd.ClangdClient
 	fileWatcher   *FileWatcher
+	reconfigurer  *Reconfigurer
 	listener      net.Listener
 	idleTimer     *time.Timer
 	idleTimeout   time.Duration
@@ -91,10 +92,23 @@ func Run(config *Config) {
 		daemon.logger.Error("Failed to write lock file: %v", err)
 		os.Exit(1)
 	}
-	defer RemoveLockFile(config.ProjectRoot)
+	defer RemoveOwnLockFile(config.ProjectRoot, os.Getpid())
+
+	// Load the optional per-project configuration. A malformed file is fatal:
+	// continuing with defaults would make the daemon's behavior diverge from
+	// the configuration the user wrote, which is harder to diagnose than an
+	// upfront error.
+	projectConfig, err := LoadProjectConfig(config.ProjectRoot)
+	if err != nil {
+		daemon.logger.Error("Failed to load project config: %v", err)
+		os.Exit(1)
+	}
+	if projectConfig != nil {
+		daemon.logger.Info("Loaded project configuration from %s", ConfigPath(config.ProjectRoot))
+	}
 
 	// Ensure compilation database exists
-	buildDir, err := EnsureCompilationDatabase(config.ProjectRoot, daemon.logger)
+	buildDir, err := EnsureCompilationDatabase(config.ProjectRoot, projectConfig, daemon.logger)
 	if err != nil {
 		daemon.logger.Error("Failed to find compilation database: %v", err)
 		os.Exit(1)
@@ -102,7 +116,11 @@ func Run(config *Config) {
 
 	// Start clangd
 	daemon.logger.Info("Starting clangd with build directory: %s", buildDir)
-	daemon.clangdClient, err = clangd.NewClangdClient(config.ProjectRoot, buildDir, daemon.logger)
+	var clangdArgs []string
+	if projectConfig != nil {
+		clangdArgs = projectConfig.ClangdArgs
+	}
+	daemon.clangdClient, err = clangd.NewClangdClient(config.ProjectRoot, buildDir, clangdArgs, daemon.logger)
 	if err != nil {
 		daemon.logger.Error("Failed to start clangd: %v", err)
 		os.Exit(1)
@@ -116,6 +134,15 @@ func Run(config *Config) {
 		// Continue without file watching
 	} else {
 		defer daemon.fileWatcher.Stop()
+	}
+
+	// Setup auto-reconfiguration for globbing build systems. Only enabled
+	// when the project opts in and provides a generate command to re-run.
+	if projectConfig != nil && projectConfig.AutoReconfigure && projectConfig.Generate != "" {
+		daemon.reconfigurer = NewReconfigurer(config.ProjectRoot,
+			projectConfig.Generate, projectConfig.ReconfigureDelayParsed, daemon.logger)
+		defer daemon.reconfigurer.Stop()
+		daemon.logger.Info("Auto-reconfigure enabled (delay %s)", daemon.reconfigurer.delay)
 	}
 
 	// Setup idle timeout
@@ -165,7 +192,7 @@ func (d *Daemon) checkExistingDaemon() error {
 
 	if lockInfo != nil {
 		if IsProcessAlive(lockInfo.PID) {
-			if IsDaemonStale(lockInfo) {
+			if IsDaemonStale(d.projectRoot, lockInfo) {
 				d.logger.Info("Existing daemon is stale, attempting to stop it")
 				// Try to gracefully stop the old daemon
 				syscall.Kill(lockInfo.PID, syscall.SIGTERM)
@@ -405,11 +432,29 @@ func (d *Daemon) handleLogs(req Request) (json.RawMessage, error) {
 	return json.Marshal(map[string]string{"logs": logs})
 }
 
-func (d *Daemon) onFilesChanged(files []string) {
-	d.logger.Debug("Files changed: %v", files)
+func (d *Daemon) onFilesChanged(changes FileChanges) {
+	d.logger.Debug("Files changed: %d modified, %d created, %d removed",
+		len(changes.Changed), len(changes.Created), changes.RemovedCount)
 
 	if d.clangdClient != nil {
-		// Notify clangd about file changes
-		d.clangdClient.OnFilesChanged(files)
+		// Content changes: tell clangd to re-index the affected files.
+		d.clangdClient.OnFilesChanged(changes.Changed)
+
+		// Newly created files are not in the compilation database yet, so
+		// open them directly: clangd infers their compile flags from
+		// neighboring files, which makes their symbols searchable
+		// immediately, before any reconfigure has run.
+		for _, file := range changes.Created {
+			if err := d.clangdClient.OpenDocument(d.clangdClient.FileURIFromPath(file)); err != nil {
+				d.logger.Error("Failed to open new file %s in clangd: %v", file, err)
+			}
+		}
+	}
+
+	// Additions and removals change the file set that a globbing build
+	// system would generate; schedule a reconfigure when the project opted
+	// into it.
+	if d.reconfigurer != nil && (len(changes.Created) > 0 || changes.RemovedCount > 0) {
+		d.reconfigurer.NotifySetChanged()
 	}
 }

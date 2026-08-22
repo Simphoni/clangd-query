@@ -6,8 +6,8 @@ cd go
 
 if [ -n "$1" ]; then
     # Run specific test
-    go test -v ./test ./internal/lsp -run "$1"
+    go test -v ./test ./internal/... -run "$1"
 else
     # Run all tests
-    go test -v ./test ./internal/lsp
+    go test -v ./test ./internal/...
 fi

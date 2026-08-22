@@ -13,7 +13,10 @@ func TestUsagesCommand(t *testing.T) {
 		tc.AssertExitCode(result, 0)
 		// Should show the selected symbol and references
 		tc.AssertContains(result.Stdout, "Selected symbol: game_engine::GameObject")
-		tc.AssertContains(result.Stdout, "Found 33 references:")
+		// The exact reference count depends on the clangd version's indexing
+		// behavior (e.g. whether implicit constructor references are reported);
+		// 38 is the count produced by clangd 22 on this fixture.
+		tc.AssertContains(result.Stdout, "Found 38 references:")
 		// Check for some key references
 		tc.AssertContains(result.Stdout, "include/core/game_object.h:")
 		tc.AssertContains(result.Stdout, "include/game/character.h:") // Character inherits from GameObject

@@ -309,7 +309,7 @@ func Run(config *Config) error {
 		needStart = true
 		daemon.RemoveLockFile(projectRoot)
 		daemon.CleanupSocket(lockInfo.SocketPath)
-	} else if daemon.IsDaemonStale(lockInfo) {
+	} else if daemon.IsDaemonStale(projectRoot, lockInfo) {
 		// Stop old daemon
 		if config.Verbose {
 			fmt.Fprintf(os.Stderr, "Stopping stale daemon (PID %d)...\n", lockInfo.PID)
@@ -392,9 +392,17 @@ func startDaemon(projectRoot string, verbose bool) error {
 	// Don't wait for it - let it run in background
 	go cmd.Wait()
 
-	// Wait for daemon to be ready
+	// Wait for the daemon's socket to appear. Startup can legitimately take
+	// a long time: on a cold start the daemon may run a user-configured
+	// generate command (e.g. a CMake preset configure) and clangd's initial
+	// indexing before it begins listening, so the wait budget is generous
+	// and configurable. Liveness is tracked through the spawned process
+	// itself rather than the lock file, so a leftover lock from a previous
+	// daemon cannot trick the client into giving up on a healthy one.
 	socketPath := daemon.GetSocketPath(projectRoot)
-	for i := 0; i < 50; i++ { // 5 seconds timeout
+	timeout := startupTimeout()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
 		if _, err := os.Stat(socketPath); err == nil {
 			// Socket exists, try to connect
 			if conn, err := net.Dial("unix", socketPath); err == nil {
@@ -402,8 +410,62 @@ func startDaemon(projectRoot string, verbose bool) error {
 				return nil
 			}
 		}
+
+		if !daemon.IsProcessAlive(cmd.Process.Pid) {
+			return fmt.Errorf("daemon exited during startup%s", daemonLogTail(projectRoot))
+		}
+
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return fmt.Errorf("daemon failed to start within timeout")
+	return fmt.Errorf("daemon failed to start within %s%s", timeout, daemonLogTail(projectRoot))
+}
+
+// Returns how long the client waits for a freshly started daemon to become
+// ready. Defaults to two minutes and can be overridden with the
+// CLANGD_QUERY_STARTUP_TIMEOUT environment variable using Go duration syntax
+// (e.g. "30s", "5m"), mirroring the daemon's CLANGD_DAEMON_TIMEOUT setting.
+// Cold starts of large projects can involve a full CMake configure and clangd
+// indexing before the daemon accepts connections, which is why the budget is
+// far larger than a request timeout.
+func startupTimeout() time.Duration {
+	if value := os.Getenv("CLANGD_QUERY_STARTUP_TIMEOUT"); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return 2 * time.Minute
+}
+
+// Reads the last chunk of the daemon's log file and formats it for inclusion
+// in a startup error message. Returns an empty string when the log cannot be
+// read. The tail usually contains the reason a daemon died during startup,
+// most commonly a failing generate command, so surfacing it saves a separate
+// trip to the log file.
+func daemonLogTail(projectRoot string) string {
+	const tailSize = 2000
+
+	logPath := daemon.GetLogPath(projectRoot)
+	file, err := os.Open(logPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return ""
+	}
+
+	offset := int64(0)
+	if stat.Size() > tailSize {
+		offset = stat.Size() - tailSize
+	}
+
+	buf := make([]byte, stat.Size()-offset)
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		return ""
+	}
+
+	return "\n--- daemon log tail ---\n" + string(buf)
 }

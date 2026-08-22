@@ -92,7 +92,11 @@ func (c *ClangdClient) PathFromFileURI(uri string) string {
 // This function starts the clangd subprocess, establishes LSP communication,
 // and waits for initial indexing to complete. The buildDir should contain
 // a compile_commands.json file for accurate code intelligence.
-func NewClangdClient(projectRoot, buildDir string, log logger.Logger) (*ClangdClient, error) {
+//
+// The extraArgs are appended to the clangd command line after the built-in
+// flags, allowing projects to pass additional options (such as --query-driver
+// for non-host toolchains) through their .clangd-query.json configuration.
+func NewClangdClient(projectRoot, buildDir string, extraArgs []string, log logger.Logger) (*ClangdClient, error) {
 	// Find clangd executable
 	clangdPath, err := exec.LookPath("clangd")
 	if err != nil {
@@ -100,11 +104,14 @@ func NewClangdClient(projectRoot, buildDir string, log logger.Logger) (*ClangdCl
 	}
 
 	// Start clangd process
-	cmd := exec.Command(clangdPath,
+	args := []string{
 		"--background-index",
 		fmt.Sprintf("--compile-commands-dir=%s", buildDir),
 		"--log=verbose",
-		"--header-insertion=never")
+		"--header-insertion=never",
+	}
+	args = append(args, extraArgs...)
+	cmd := exec.Command(clangdPath, args...)
 
 	// Create a pipe to capture and parse clangd's stderr
 	stderrPipe, err := cmd.StderrPipe()

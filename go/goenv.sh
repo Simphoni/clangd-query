@@ -4,10 +4,10 @@
 # Source this file or run commands through it
 
 # Set up Go environment
-export GOROOT=/usr/local/go
+export GOROOT=$HOME/local/go
 export GOPATH=$HOME/go
 export PATH=$GOROOT/bin:$GOPATH/bin:$PATH
-export GOPROXY=https://proxy.golang.org
+export GOPROXY=https://goproxy.cn,direct
 export GOSUMDB=sum.golang.org
 
 if [ $# -eq 0 ]; then
