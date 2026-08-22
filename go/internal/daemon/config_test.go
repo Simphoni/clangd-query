@@ -126,7 +126,7 @@ func TestConfigMTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to stat config file: %v", err)
 	}
-	if mtime := ConfigMTime(dir); mtime != stat.ModTime().Unix() {
-		t.Fatalf("expected mtime %d, got %d", stat.ModTime().Unix(), mtime)
+	if mtime := ConfigMTime(dir); mtime != stat.ModTime().UnixNano() {
+		t.Fatalf("expected mtime %d, got %d", stat.ModTime().UnixNano(), mtime)
 	}
 }

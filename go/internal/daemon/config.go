@@ -150,5 +150,5 @@ func ConfigMTime(projectRoot string) int64 {
 	if err != nil {
 		return 0
 	}
-	return stat.ModTime().Unix()
+	return stat.ModTime().UnixNano()
 }

@@ -47,6 +47,15 @@ type InitializeParams struct {
 type ClientCapabilities struct {
 	TextDocument TextDocumentClientCapabilities `json:"textDocument,omitempty"`
 	Workspace    WorkspaceClientCapabilities    `json:"workspace,omitempty"`
+	Window       WindowClientCapabilities       `json:"window,omitempty"`
+}
+
+// WindowClientCapabilities declares which window-related LSP features the
+// client supports. WorkDoneProgress must be advertised for clangd to send
+// $/progress notifications, which are the only reliable signal that the
+// background index has finished building.
+type WindowClientCapabilities struct {
+	WorkDoneProgress bool `json:"workDoneProgress,omitempty"`
 }
 
 type TextDocumentClientCapabilities struct {

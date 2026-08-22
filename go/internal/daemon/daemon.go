@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -112,6 +113,23 @@ func Run(config *Config) {
 	if err != nil {
 		daemon.logger.Error("Failed to find compilation database: %v", err)
 		os.Exit(1)
+	}
+
+	// When the project now uses a configured compilation database, the old
+	// private build directory left behind by a previous zero-config run is
+	// obsolete. Removing it prevents confusion about which index the daemon
+	// is actually using.
+	if projectConfig != nil && projectConfig.CompileCommands != "" {
+		defaultBuildDir := filepath.Join(config.ProjectRoot, ".cache", "clangd-query", "build")
+		if buildDir != defaultBuildDir {
+			if _, err := os.Stat(defaultBuildDir); err == nil {
+				if err := os.RemoveAll(defaultBuildDir); err != nil {
+					daemon.logger.Error("Failed to remove obsolete default build directory %s: %v", defaultBuildDir, err)
+				} else {
+					daemon.logger.Info("Removed obsolete default build directory %s; project now uses %s", defaultBuildDir, buildDir)
+				}
+			}
+		}
 	}
 
 	// Start clangd
