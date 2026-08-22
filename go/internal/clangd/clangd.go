@@ -29,6 +29,7 @@ type ClangdClient struct {
 	indexingDone  chan struct{}
 	isIndexing    bool
 	indexingSince time.Time
+	indexingToken interface{}
 	indexingMu    sync.RWMutex
 	openDocuments map[string]bool
 	docMu         sync.RWMutex
@@ -290,12 +291,19 @@ func (c *ClangdClient) handleProgress(params json.RawMessage) {
 	c.indexingMu.Lock()
 	defer c.indexingMu.Unlock()
 
-	if progress.Value.Kind == "begin" && strings.Contains(strings.ToLower(progress.Value.Title), "index") {
-		if !c.isIndexing {
-			c.isIndexing = true
+	switch progress.Value.Kind {
+	case "begin":
+		// clangd uses the title "indexing" for its background index progress
+		// session. Other progress sessions must not move the indexing state.
+		if strings.Contains(strings.ToLower(progress.Value.Title), "index") {
+			if !c.isIndexing {
+				c.isIndexing = true
+				c.indexingSince = time.Now()
+			}
+			c.indexingToken = progress.Token
 		}
-	} else if progress.Value.Kind == "end" {
-		if c.isIndexing {
+	case "end":
+		if c.isIndexing && progress.Token == c.indexingToken {
 			c.isIndexing = false
 			select {
 			case <-c.indexingDone:
@@ -303,6 +311,7 @@ func (c *ClangdClient) handleProgress(params json.RawMessage) {
 			default:
 				close(c.indexingDone)
 			}
+			c.logger.Info("clangd background index is ready")
 		}
 	}
 }

@@ -66,28 +66,39 @@ var (
 	ErrTimeout          = errors.New("request timeout")
 )
 
-// Transport manages synchronous JSON-RPC 2.0 communication over stdin/stdout.
-// It implements a simple request-response model where each request blocks until
-// its response is received. This design eliminates complexity around concurrent
-// request tracking while still supporting asynchronous notifications from the server.
+// Transport manages JSON-RPC 2.0 communication over stdin/stdout using a
+// dedicated background reader. This is important because clangd sends
+// asynchronous notifications (most notably $/progress for background
+// indexing) even when no request is outstanding; a transport that only reads
+// while waiting for a response would never observe those notifications.
 //
-// The transport ensures thread-safety by serializing all requests through a mutex,
-// making it impossible to have response mismatches or race conditions.
+// Requests are serialized through a mutex so there is no ambiguity about
+// which response belongs to which caller, while the reader goroutine
+// concurrently dispatches notifications and routes responses to waiting
+// callers.
 type Transport struct {
 	reader *bufio.Reader
 	writer io.Writer
 	stderr io.Writer
 
-	nextID int64      // Atomic counter for generating unique request IDs
-	mu     sync.Mutex // Serializes all requests and protects the closed flag
-	closed bool       // Set to true when the connection fails or closes
+	nextID atomic.Int64
 
-	handlers   map[string]NotificationHandler // Registered handlers for server notifications
-	handlersMu sync.RWMutex                   // Protects the handlers map
+	writeMu sync.Mutex
+
+	pendingMu sync.Mutex
+	pending   map[string]chan *Response
+
+	handlersMu sync.RWMutex
+	handlers   map[string]NotificationHandler
+
+	startOnce sync.Once
+	done      chan struct{}
+
+	closedMu sync.Mutex
+	closed   bool
 }
 
 // NotificationHandler processes incoming notifications from the server.
-// Handlers are called asynchronously when notifications arrive.
 type NotificationHandler func(params json.RawMessage)
 
 // Creates a new Transport for JSON-RPC communication.
@@ -99,12 +110,20 @@ func NewTransport(stdin io.Reader, stdout, stderr io.Writer) *Transport {
 		writer:   stdout,
 		stderr:   stderr,
 		handlers: make(map[string]NotificationHandler),
+		pending:  make(map[string]chan *Response),
+		done:     make(chan struct{}),
 	}
 }
 
+// Starts the background reader goroutine. Start is idempotent: only the first
+// call has an effect.
+func (t *Transport) Start() {
+	t.startOnce.Do(func() {
+		go t.readLoop()
+	})
+}
+
 // Registers a handler for a specific notification method.
-// When a notification with the given method name arrives from the server,
-// the handler will be called asynchronously with the notification parameters.
 // Only one handler can be registered per method; subsequent registrations
 // will replace the previous handler.
 func (t *Transport) RegisterNotificationHandler(method string, handler NotificationHandler) {
@@ -113,21 +132,26 @@ func (t *Transport) RegisterNotificationHandler(method string, handler Notificat
 	t.handlers[method] = handler
 }
 
-// Sends a JSON-RPC request and blocks until the response is received.
-// This method is thread-safe and ensures that only one request is in flight at a time.
-// The method automatically generates a unique ID for request correlation and handles
-// timeout (30 seconds) to prevent indefinite blocking. Any notifications received
-// while waiting for the response are dispatched to their registered handlers.
+// Sends a JSON-RPC request and blocks until the response arrives or the
+// 30-second request timeout expires. This method is safe for concurrent use;
+// writes are serialized and responses are correlated by request ID.
 func (t *Transport) SendRequest(method string, params interface{}) (json.RawMessage, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.closed {
+	if t.isClosed() {
 		return nil, ErrConnectionClosed
 	}
 
-	// Generate unique string ID to avoid JSON number type ambiguity
-	id := strconv.FormatInt(atomic.AddInt64(&t.nextID, 1), 10)
+	id := strconv.FormatInt(t.nextID.Add(1), 10)
+	responseCh := make(chan *Response, 1)
+
+	t.pendingMu.Lock()
+	t.pending[id] = responseCh
+	t.pendingMu.Unlock()
+
+	defer func() {
+		t.pendingMu.Lock()
+		delete(t.pending, id)
+		t.pendingMu.Unlock()
+	}()
 
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
@@ -141,60 +165,31 @@ func (t *Transport) SendRequest(method string, params interface{}) (json.RawMess
 		Params:  paramsJSON,
 	}
 
-	// Write the request to the output stream
-	if err := t.writeMessage(req); err != nil {
-		t.closed = true
+	t.writeMu.Lock()
+	err = t.writeMessage(req)
+	t.writeMu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("Error writing request: %w", err)
 	}
 
-	// Read the response in a goroutine to implement timeout
-	type result struct {
-		resp *Response
-		err  error
-	}
-	done := make(chan result, 1)
-
-	go func() {
-		resp, err := t.readResponse(id)
-		select {
-		case done <- result{resp, err}:
-		default:
-			// Timeout already occurred, discard result
-		}
-	}()
-
-	// Block until we get a response or timeout
 	select {
-	case r := <-done:
-		if r.err != nil {
-			if errors.Is(r.err, io.EOF) || errors.Is(r.err, io.ErrUnexpectedEOF) {
-				t.closed = true
-				return nil, ErrConnectionClosed
-			}
-			return nil, r.err
+	case resp := <-responseCh:
+		if resp == nil {
+			return nil, ErrConnectionClosed
 		}
-
-		if r.resp.Error != nil {
-			return nil, fmt.Errorf("RPC error %d: %s", r.resp.Error.Code, r.resp.Error.Message)
+		if resp.Error != nil {
+			return nil, fmt.Errorf("RPC error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
-
-		return r.resp.Result, nil
+		return resp.Result, nil
 
 	case <-time.After(30 * time.Second):
-		t.closed = true
 		return nil, ErrTimeout
 	}
 }
 
 // Sends a notification to the server without expecting a response.
-// Notifications are fire-and-forget messages used for events like
-// file opened/closed notifications. This method returns immediately
-// after writing the notification to the output stream.
 func (t *Transport) SendNotification(method string, params interface{}) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.closed {
+	if t.isClosed() {
 		return ErrConnectionClosed
 	}
 
@@ -209,62 +204,83 @@ func (t *Transport) SendNotification(method string, params interface{}) error {
 		Params:  paramsJSON,
 	}
 
-	if err := t.writeMessage(notif); err != nil {
-		t.closed = true
+	t.writeMu.Lock()
+	err = t.writeMessage(notif)
+	t.writeMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("Error writing notification: %w", err)
 	}
 
 	return nil
 }
 
-// Placeholder for notification reader initialization.
-// In this synchronous implementation, notifications are processed inline
-// while waiting for responses, avoiding the need for a separate reader goroutine.
-// This design prevents reader conflicts and simplifies the implementation.
-func (t *Transport) Start() {
-	// Notifications are handled during readResponse, not in a separate goroutine
-}
-
-// Reads messages from the input stream until it finds a response with the expected ID.
-// Any notifications encountered while waiting are dispatched to their handlers.
-// This approach ensures we never miss notifications even while waiting for a response.
-func (t *Transport) readResponse(expectedID string) (*Response, error) {
+// Continuous read loop for the server output stream. It separates incoming
+// messages into notifications, server-initiated requests, and responses, and
+// routes each appropriately. The loop exits when the stream closes.
+func (t *Transport) readLoop() {
 	for {
 		msg, err := t.readMessage()
 		if err != nil {
-			return nil, err
-		}
-
-		// Found the response we're waiting for
-		if id, ok := msg["id"].(string); ok && id == expectedID {
-			var resp Response
-			data, _ := json.Marshal(msg)
-			if err := json.Unmarshal(data, &resp); err != nil {
-				return nil, fmt.Errorf("Error decoding response: %w", err)
+			if !t.isClosed() {
+				t.setClosed()
+				t.failAllPending()
 			}
-			return &resp, nil
+			return
 		}
 
-		// Process any notifications that arrive while waiting
-		if msg["id"] == nil && msg["method"] != nil {
-			var notif Notification
-			if data, _ := json.Marshal(msg); data != nil {
-				if err := json.Unmarshal(data, &notif); err == nil {
-					go func() {
-						t.handleNotification(&notif)
-					}()
+		_, hasMethod := msg["method"].(string)
+		if hasMethod {
+			if msg["id"] != nil {
+				// Server-initiated request. The only one clangd currently
+				// sends is window/workDoneProgress/create, which expects a
+				// null result. Answering it is required before clangd sends
+				// $/progress notifications.
+				t.handleServerRequest(msg)
+			} else {
+				var notif Notification
+				data, _ := json.Marshal(msg)
+				if json.Unmarshal(data, &notif) == nil {
+					t.handleNotification(&notif)
 				}
 			}
+			continue
 		}
-		// Ignore responses for other IDs (shouldn't happen in synchronous mode)
+
+		// Response to one of our outstanding requests.
+		id := responseID(msg)
+		if id == "" {
+			continue
+		}
+
+		var resp Response
+		data, _ := json.Marshal(msg)
+		if json.Unmarshal(data, &resp) != nil {
+			continue
+		}
+		t.deliverResponse(id, &resp)
 	}
 }
 
-// Reads a single JSON-RPC message from the input stream.
-// Messages use HTTP-style headers with Content-Length to frame the JSON payload.
-// This is the standard format used by the Language Server Protocol.
+// Replies to a server-initiated request. clangd's window/workDoneProgress/create
+// accepts a null result; no other server requests are currently implemented.
+func (t *Transport) handleServerRequest(msg map[string]interface{}) {
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      msg["id"],
+		"result":  nil,
+	}
+
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := t.writeMessage(response); err != nil {
+		t.setClosed()
+		t.failAllPending()
+	}
+}
+
+// Reads a single JSON-RPC message from the input stream using the standard
+// LSP Content-Length framing.
 func (t *Transport) readMessage() (map[string]interface{}, error) {
-	// Parse HTTP-style headers
 	var contentLength int
 	for {
 		line, err := t.reader.ReadString('\n')
@@ -274,7 +290,7 @@ func (t *Transport) readMessage() (map[string]interface{}, error) {
 
 		line = strings.TrimSpace(line)
 		if line == "" {
-			break // Empty line indicates end of headers
+			break
 		}
 
 		if strings.HasPrefix(line, "Content-Length: ") {
@@ -283,7 +299,6 @@ func (t *Transport) readMessage() (map[string]interface{}, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid Content-Length: %w", err)
 			}
-			// Sanity check: messages shouldn't be larger than 10MB
 			if length < 0 || length > 10*1024*1024 {
 				return nil, fmt.Errorf("invalid Content-Length %d: must be between 0 and 10MB", length)
 			}
@@ -295,17 +310,11 @@ func (t *Transport) readMessage() (map[string]interface{}, error) {
 		return nil, errors.New("missing Content-Length header")
 	}
 
-	// Read the JSON payload based on Content-Length
 	content := make([]byte, contentLength)
-	n, err := io.ReadFull(t.reader, content)
-	if err != nil {
+	if _, err := io.ReadFull(t.reader, content); err != nil {
 		return nil, err
 	}
-	if n != contentLength {
-		return nil, fmt.Errorf("content length mismatch: expected %d, got %d", contentLength, n)
-	}
 
-	// Unmarshal into generic map to determine message type
 	var msg map[string]interface{}
 	if err := json.Unmarshal(content, &msg); err != nil {
 		return nil, fmt.Errorf("parse message: %w", err)
@@ -314,9 +323,18 @@ func (t *Transport) readMessage() (map[string]interface{}, error) {
 	return msg, nil
 }
 
-// Dispatches a notification to its registered handler if one exists.
-// Handlers are called asynchronously to avoid blocking message processing.
-// If no handler is registered for the notification method, it's silently ignored.
+// Extracts a request ID into the string form used by pending lookups.
+func responseID(msg map[string]interface{}) string {
+	if id, ok := msg["id"].(string); ok {
+		return id
+	}
+	if id, ok := msg["id"].(float64); ok {
+		return strconv.FormatFloat(id, 'f', -1, 64)
+	}
+	return ""
+}
+
+// Dispatches a notification to its registered handler, if any.
 func (t *Transport) handleNotification(notif *Notification) {
 	t.handlersMu.RLock()
 	handler, ok := t.handlers[notif.Method]
@@ -327,9 +345,37 @@ func (t *Transport) handleNotification(notif *Notification) {
 	}
 }
 
-// Writes a JSON-RPC message to the output stream with proper framing.
-// The message is preceded by HTTP-style headers including Content-Length.
-// This method assumes the caller holds the transport mutex.
+// Routes a response to the goroutine waiting for its request ID.
+func (t *Transport) deliverResponse(id string, resp *Response) {
+	t.pendingMu.Lock()
+	ch, ok := t.pending[id]
+	t.pendingMu.Unlock()
+
+	if ok {
+		select {
+		case ch <- resp:
+		default:
+			// The caller already timed out; discard the late response.
+		}
+	}
+}
+
+// Fails every outstanding request because the connection is gone.
+func (t *Transport) failAllPending() {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+
+	for id, ch := range t.pending {
+		select {
+		case ch <- nil:
+		default:
+		}
+		delete(t.pending, id)
+	}
+}
+
+// Writes a JSON-RPC message with LSP Content-Length framing. The caller must
+// hold writeMu.
 func (t *Transport) writeMessage(msg interface{}) error {
 	content, err := json.Marshal(msg)
 	if err != nil {
@@ -347,4 +393,18 @@ func (t *Transport) writeMessage(msg interface{}) error {
 	}
 
 	return nil
+}
+
+// Reports whether the transport has been marked closed.
+func (t *Transport) isClosed() bool {
+	t.closedMu.Lock()
+	defer t.closedMu.Unlock()
+	return t.closed
+}
+
+// Marks the transport closed.
+func (t *Transport) setClosed() {
+	t.closedMu.Lock()
+	t.closed = true
+	t.closedMu.Unlock()
 }
