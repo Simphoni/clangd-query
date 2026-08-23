@@ -181,6 +181,34 @@ int GetWindowHeight() const
 ```
 
 
+## Batch Queries
+
+The symbol-based commands (`search`, `show`, `view`, `usages`, `hierarchy`, `signature`, `interface`) accept multiple symbols in a single invocation. Every positional argument runs as an independent query against the daemon, and the results are printed under stable section headers:
+
+```bash
+# Show three classes in one call
+$ clangd-query show GameObject Transform Vector3
+=== show GameObject ===
+Found class 'game_engine::GameObject' (7 matches total, showing most relevant)
+...
+
+=== show Transform ===
+Found class 'game_engine::Transform' ...
+...
+
+=== show Vector3 ===
+...
+```
+
+Queries are executed sequentially over the existing daemon connection, so batching avoids process and connection overhead but still waits for each result in order. A query that finds no symbols prints a "no symbols found" note inside its own section; this is not treated as an error. A hard failure such as a malformed location or a timeout is likewise confined to its own `Error:` line so that the remaining queries always complete, but the process exits with a non-zero status and a summary on stderr whenever any query failed:
+
+```text
+Error: 1 of 2 queries failed
+```
+
+This keeps batch mode safe for scripted use: stdout always contains every successful result, while the exit code signals that something needs attention.
+
+
 ## Requirements
 
 - Go 1.21 or higher for building

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -276,44 +277,93 @@ func (c *Client) Shutdown() error {
 	return err
 }
 
-// handleCommand processes a command and returns the output as a string
-func (c *Client) handleCommand(config *Config) (string, error) {
-	// Extract symbol if needed
-	symbolCommands := map[string]bool{
-		"search":    true,
-		"show":      true,
-		"view":      true,
-		"usages":    true,
-		"hierarchy": true,
-		"signature": true,
-		"interface": true,
+// Reports whether the given command operates on one or more symbol arguments.
+// These are exactly the commands that support batch execution: every positional
+// argument after the command name is treated as an independent query target.
+func isSymbolCommand(command string) bool {
+	switch command {
+	case "search", "show", "view", "usages", "hierarchy", "signature", "interface":
+		return true
+	}
+	return false
+}
+
+// Executes a single symbol-based query and returns its formatted output. The
+// mapping between command names and RPC calls lives here so that both the
+// single-query path in handleCommand and the batch path in runBatchQueries
+// share identical behavior per query.
+func (c *Client) executeSymbolQuery(command string, symbol string, limit int) (string, error) {
+	switch command {
+	case "search":
+		return c.Search(symbol, limit)
+	case "show":
+		return c.Show(symbol)
+	case "view":
+		return c.View(symbol)
+	case "usages":
+		return c.Usages(symbol, limit)
+	case "hierarchy":
+		return c.Hierarchy(symbol, limit)
+	case "signature":
+		return c.Signature(symbol)
+	case "interface":
+		return c.Interface(symbol)
+	default:
+		return "", fmt.Errorf("unknown command: %s", command)
+	}
+}
+
+// Runs each positional argument as an independent query of the same command
+// and returns the combined sectioned output. Every section starts with a
+// "=== <command> <symbol> ===" header so that consumers can reliably locate
+// the result of an individual query. A failing query does not abort the
+// remaining ones: its error is written into its own section instead, and the
+// returned error only summarizes how many queries failed so that callers can
+// signal a non-zero exit code without discarding successful results.
+func (c *Client) runBatchQueries(config *Config) (string, error) {
+	var output strings.Builder
+	failed := 0
+
+	for i, symbol := range config.Arguments {
+		if i > 0 {
+			output.WriteString("\n")
+		}
+		fmt.Fprintf(&output, "=== %s %s ===\n", config.Command, symbol)
+
+		result, err := c.executeSymbolQuery(config.Command, symbol, config.Limit)
+		if err != nil {
+			failed++
+			fmt.Fprintf(&output, "Error: %v\n", err)
+			continue
+		}
+
+		output.WriteString(result)
+		if !strings.HasSuffix(result, "\n") {
+			output.WriteString("\n")
+		}
 	}
 
+	if failed > 0 {
+		return output.String(), fmt.Errorf("%d of %d queries failed", failed, len(config.Arguments))
+	}
+	return output.String(), nil
+}
+
+// handleCommand processes a command and returns the output as a string
+func (c *Client) handleCommand(config *Config) (string, error) {
 	symbol := ""
-	if symbolCommands[config.Command] {
+	if isSymbolCommand(config.Command) {
 		if len(config.Arguments) == 0 {
 			return "", fmt.Errorf("%s requires a symbol argument", config.Command)
 		}
 		symbol = config.Arguments[0]
 	}
 
-	// Handle each command
-	switch config.Command {
-	case "search":
-		return c.Search(symbol, config.Limit)
-	case "show":
-		return c.Show(symbol)
-	case "view":
-		return c.View(symbol)
-	case "usages":
-		return c.Usages(symbol, config.Limit)
-	case "hierarchy":
-		return c.Hierarchy(symbol, config.Limit)
-	case "signature":
-		return c.Signature(symbol)
-	case "interface":
-		return c.Interface(symbol)
+	if isSymbolCommand(config.Command) {
+		return c.executeSymbolQuery(config.Command, symbol, config.Limit)
+	}
 
+	switch config.Command {
 	case "logs":
 		// Parse log level from arguments
 		logLevel := "info" // default
@@ -406,6 +456,16 @@ func Run(config *Config) error {
 
 	// Create client
 	client := NewClient(conn, time.Duration(config.Timeout)*time.Second)
+
+	// Batch mode: more than one positional argument on a symbol command runs
+	// every argument as an independent query. The combined sections always go
+	// to stdout, even when some queries fail; the error only drives the exit
+	// code so that partial results are never discarded.
+	if isSymbolCommand(config.Command) && len(config.Arguments) > 1 {
+		output, batchErr := client.runBatchQueries(config)
+		fmt.Println(output)
+		return batchErr
+	}
 
 	// Execute command and print output
 	output, err := client.handleCommand(config)

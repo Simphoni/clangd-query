@@ -99,13 +99,17 @@ func printHelp() {
 Usage:
   clangd-query <command> [arguments] [flags]
 
+Symbol-based commands (search, show, view, usages, hierarchy, signature,
+interface) accept multiple symbols and run one independent query per symbol,
+printing each result in its own "=== <command> <symbol> ===" section.
+
 Commands:
-  search <query>              Search for symbols across the project
-  show <symbol>               Show source code of symbol
-  usages <symbol>             Find all usages of a symbol
-  hierarchy <symbol>          Show type hierarchy
-  signature <symbol>          Show function signature
-  interface <symbol>          Show public interface
+  search <query>...           Search for symbols across the project
+  show <symbol>...            Show source code of symbol
+  usages <symbol>...          Find all usages of a symbol
+  hierarchy <symbol>...       Show type hierarchy
+  signature <symbol>...       Show function signature
+  interface <symbol>...       Show public interface
   logs                        Show daemon logs
   status                      Show daemon status
   shutdown                    Shutdown the daemon
@@ -119,6 +123,7 @@ Flags:
 Examples:
   clangd-query search Widget
   clangd-query show GameScene::update
+  clangd-query show GameObject Transform Renderer
   clangd-query usages src/main.cpp:42:15
   clangd-query hierarchy BaseClass --limit 10`)
 }
