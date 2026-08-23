@@ -39,6 +39,18 @@ clangd-query usages GameObject::Update RenderSystem::Draw
 
 Use batch form when you already know several independent queries; it saves one tool-call round trip per query. Keep the single-symbol form when the next query depends on the previous result.
 
+For queries that mix different commands, use `batch`. It reads one full query per line from stdin (or a file argument) and runs each independently:
+
+```bash
+clangd-query batch <<'EOF'
+show GameObject
+usages GameObject::Update --limit 20
+hierarchy Transform
+EOF
+```
+
+Blank lines and `#` comments are ignored. Per-line flags like `--limit` work; operational commands (`status`, `logs`, `shutdown`) cannot be batched.
+
 A query that cannot find its symbol prints a "no symbols found" note inside its own section without affecting other sections or the exit code. A hard failure (bad location, timeout, daemon error) is likewise confined to its section, but makes the command exit non-zero so failures are never silent.
 
 ## Command reference
@@ -162,6 +174,7 @@ Newly created files are searchable immediately before any reconfigure: the daemo
 6. If results look incomplete, check `clangd-query status` to confirm `Indexing: no`; retry after indexing finishes rather than assuming a bug.
 7. Prefer `--limit` on broad searches to keep output small.
 8. When you have already decided on several independent lookups, combine them into one multi-symbol invocation to reduce round trips.
+9. When those lookups use different commands, combine them with `batch` instead: one line per complete query.
 
 ## Common workflows
 

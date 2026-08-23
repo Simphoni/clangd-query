@@ -209,6 +209,27 @@ Error: 1 of 2 queries failed
 This keeps batch mode safe for scripted use: stdout always contains every successful result, while the exit code signals that something needs attention.
 
 
+### The `batch` command
+
+When the queries mix different commands, use `batch`. It reads one complete query per line from standard input (or from a file named as its optional argument) and executes each line independently, including per-line `--limit` values:
+
+```bash
+$ clangd-query batch <<'EOF'
+# Understand the render pipeline before refactoring it
+show RenderSystem
+interface RenderSystem
+usages Renderable --limit 20
+hierarchy GameObject
+EOF
+=== show RenderSystem ===
+...
+
+=== interface RenderSystem ===
+...
+```
+
+Blank lines and lines starting with `#` are skipped. Each line is parsed like a normal invocation: double-quoted arguments are supported, and unsupported lines (operational commands such as `status` or `shutdown` cannot be batched) produce an error in their own section without stopping the remaining queries. The exit code is non-zero when any line failed hard, with a summary on stderr.
+
 ## Requirements
 
 - Go 1.21 or higher for building

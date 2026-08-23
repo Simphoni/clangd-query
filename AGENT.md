@@ -62,6 +62,16 @@ clangd-query interface GameObject
 ```
 Shows only public methods and members - what users of the class can access.
 
+### `batch` - Run several queries in one call
+```bash
+clangd-query batch <<'EOF'
+show GameObject
+usages GameObject::Update --limit 20
+hierarchy Transform
+EOF
+```
+Reads one full query per line from stdin (or from a file given as argument) and runs each independently, printing results under `=== <command> <symbol> ===` section headers. Blank lines and `#` comments are ignored; per-line flags like `--limit` work. When a line fails hard, the error stays inside its own section and the remaining lines still run, but the exit code is non-zero. Use this once you already know a set of independent queries to save round trips.
+
 ## Best Practices for AI Agents
 
 ### 1. Start with search

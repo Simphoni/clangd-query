@@ -1,6 +1,7 @@
 package test
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -84,5 +85,109 @@ func TestBatchQueries(t *testing.T) {
 		tc.AssertExitCode(result, 0)
 		tc.AssertContains(result.Stdout, "=== usages GameObject ===")
 		tc.AssertContains(result.Stdout, "=== usages include/core/component.h:11:7 ===")
+	})
+}
+
+func TestBatchCommand(t *testing.T) {
+	tc := GetTestContext(t)
+
+	t.Run("Mixed commands run one query per input line", func(t *testing.T) {
+		stdin := "show GameObject::Update\nusages GameObject\ninterface Engine\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		tc.AssertExitCode(result, 0)
+		tc.AssertContains(result.Stdout, "=== show GameObject::Update ===")
+		tc.AssertContains(result.Stdout, "void Update(float delta_time) override;")
+		tc.AssertContains(result.Stdout, "=== usages GameObject ===")
+		tc.AssertContains(result.Stdout, "=== interface Engine ===")
+		tc.AssertContains(result.Stdout, "Public Interface:")
+	})
+
+	t.Run("Comments and blank lines are ignored", func(t *testing.T) {
+		stdin := "# look up two classes\n\nshow Transform\n   \n# show GameObject\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		tc.AssertExitCode(result, 0)
+		tc.AssertContains(result.Stdout, "=== show Transform ===")
+		tc.AssertNotContains(result.Stdout, "GameObject")
+	})
+
+	t.Run("Per-line --limit restricts only its own line", func(t *testing.T) {
+		stdin := "search Update --limit 2\nsearch Update --limit 5\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		tc.AssertExitCode(result, 0)
+
+		// Section headers carry the command and symbol but not flags, so the
+		// two identical-looking headers are told apart by position.
+		header := "=== search Update ==="
+		firstIndex := strings.Index(result.Stdout, header)
+		secondIndex := strings.Index(result.Stdout[firstIndex+len(header):], header)
+		if firstIndex == -1 || secondIndex == -1 {
+			t.Fatalf("Expected two %q sections\nStdout:\n%s", header, result.Stdout)
+		}
+		secondIndex += firstIndex + len(header)
+
+		limited := CountOccurrences(result.Stdout[:secondIndex], "- `")
+		if limited != 2 {
+			t.Errorf("Expected exactly 2 limited search results, got %d\nStdout:\n%s",
+				limited, result.Stdout)
+		}
+		unlimited := CountOccurrences(result.Stdout[secondIndex:], "- `")
+		if unlimited < 3 {
+			t.Errorf("Expected the unlimited line to return more results, got %d\nStdout:\n%s",
+				unlimited, result.Stdout)
+		}
+	})
+
+	t.Run("Multiple symbols on one line expand into separate sections", func(t *testing.T) {
+		stdin := "show GameObject Transform\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		tc.AssertExitCode(result, 0)
+		tc.AssertContains(result.Stdout, "=== show GameObject ===")
+		tc.AssertContains(result.Stdout, "=== show Transform ===")
+	})
+
+	t.Run("Malformed and unsupported lines fail in isolation", func(t *testing.T) {
+		stdin := "show\nstatus\nhierarchy Transform\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		if result.ExitCode != 1 {
+			t.Errorf("Expected exit code 1 for failing batch lines, got %d", result.ExitCode)
+		}
+		tc.AssertContains(result.Stdout, "=== show ===")
+		tc.AssertContains(result.Stdout, "requires a symbol argument")
+		tc.AssertContains(result.Stdout, `command "status" is not supported in batch mode`)
+		// The valid line after the failures must still have run.
+		tc.AssertContains(result.Stdout, "=== hierarchy Transform ===")
+
+		if !strings.Contains(result.Stderr, "2 of 3 batch queries failed") {
+			t.Errorf("Expected stderr to summarize batch failures\nStderr: %s",
+				result.Stderr)
+		}
+	})
+
+	t.Run("Quoted arguments survive tokenization", func(t *testing.T) {
+		stdin := "show \"GameObject::Update\"\n"
+		result := tc.RunCommandWithStdin([]string{"batch"}, stdin)
+		tc.AssertExitCode(result, 0)
+		tc.AssertContains(result.Stdout, "void Update(float delta_time) override;")
+	})
+
+	t.Run("Queries can be read from a file instead of stdin", func(t *testing.T) {
+		queryFile := tc.T.TempDir() + "/queries.txt"
+		if err := os.WriteFile(queryFile,
+			[]byte("# generated\nshow Vector3\n"), 0644); err != nil {
+			t.Fatalf("Failed to write query file: %v", err)
+		}
+
+		result := tc.RunCommand("batch", queryFile)
+		tc.AssertExitCode(result, 0)
+		tc.AssertContains(result.Stdout, "=== show Vector3 ===")
+		tc.AssertContains(result.Stdout, "struct Vector3 {")
+	})
+
+	t.Run("Empty input fails before contacting the daemon", func(t *testing.T) {
+		result := tc.RunCommandWithStdin([]string{"batch"}, "\n# only a comment\n")
+		if result.ExitCode != 1 {
+			t.Errorf("Expected exit code 1 for empty batch input, got %d", result.ExitCode)
+		}
+		tc.AssertContains(result.Stderr, "batch mode requires at least one query line")
 	})
 }

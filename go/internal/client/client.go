@@ -7,9 +7,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"clangd-query/internal/daemon"
 )
@@ -349,6 +351,132 @@ func (c *Client) runBatchQueries(config *Config) (string, error) {
 	return output.String(), nil
 }
 
+// Parses one batch input line into its command name, positional arguments and
+// optional per-line limit. Lines are whitespace-separated with support for
+// double-quoted arguments, so a line like `search "My Class" --limit 5` is
+// split the same way the top-level argument parser would split it. Only
+// --limit is recognized per line because the other global flags either apply
+// to the whole process (--verbose) or make no sense per query (--timeout).
+func parseQueryLine(line string) (command string, args []string, limit int, err error) {
+	tokens, err := tokenizeQueryLine(line)
+	if err != nil {
+		return "", nil, 0, err
+	}
+
+	limit = -1
+	for i := 0; i < len(tokens); i++ {
+		token := tokens[i]
+		switch {
+		case token == "--limit":
+			if i+1 >= len(tokens) {
+				return "", nil, 0, fmt.Errorf("flag --limit requires a value")
+			}
+			parsed, convErr := strconv.Atoi(tokens[i+1])
+			if convErr != nil {
+				return "", nil, 0, fmt.Errorf("invalid limit value: %s", tokens[i+1])
+			}
+			limit = parsed
+			i++
+		case strings.HasPrefix(token, "-"):
+			return "", nil, 0, fmt.Errorf("unsupported flag %q in batch query line", token)
+		case command == "":
+			command = token
+		default:
+			args = append(args, token)
+		}
+	}
+	return command, args, limit, nil
+}
+
+// Splits a batch input line into whitespace-separated tokens, treating any
+// text between double quotes as a single token. Quotes themselves are stripped
+// from the token so that quoted symbols arrive at the daemon without them.
+func tokenizeQueryLine(line string) ([]string, error) {
+	var tokens []string
+	var current strings.Builder
+	inQuotes := false
+
+	for _, r := range line {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+		case unicode.IsSpace(r) && !inQuotes:
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if inQuotes {
+		return nil, fmt.Errorf("unterminated quote in batch query line")
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+	return tokens, nil
+}
+
+// Runs a full batch session where every input line is a complete query command
+// such as `show GameObject` or `hierarchy Transform --limit 5`. This differs
+// from runBatchQueries, which repeats one fixed command across all arguments:
+// here each line picks its own command and flags. Sections follow the same
+// rules as everywhere else in batch mode: every query gets a stable header,
+// failures are confined to their own section, and the returned error only
+// summarizes how many queries failed so that successful results survive on
+// stdout even when the process exits non-zero.
+func (c *Client) runCommandLineBatch(lines []string) (string, error) {
+	var output strings.Builder
+	failed := 0
+	total := 0
+	firstSection := true
+
+	writeSection := func(header string, result string, err error) {
+		if !firstSection {
+			output.WriteString("\n")
+		}
+		firstSection = false
+		total++
+
+		fmt.Fprintf(&output, "=== %s ===\n", header)
+		if err != nil {
+			failed++
+			fmt.Fprintf(&output, "Error: %v\n", err)
+			return
+		}
+		output.WriteString(result)
+		if !strings.HasSuffix(result, "\n") {
+			output.WriteString("\n")
+		}
+	}
+
+	for _, line := range lines {
+		command, args, limit, err := parseQueryLine(line)
+		if err == nil && !isSymbolCommand(command) {
+			err = fmt.Errorf("command %q is not supported in batch mode", command)
+		}
+		if err == nil && len(args) == 0 {
+			err = fmt.Errorf("%s requires a symbol argument", command)
+		}
+		if err != nil {
+			writeSection(line, "", err)
+			continue
+		}
+
+		for _, symbol := range args {
+			result, queryErr := c.executeSymbolQuery(command, symbol, limit)
+			writeSection(command+" "+symbol, result, queryErr)
+		}
+	}
+
+	if failed > 0 {
+		return output.String(), fmt.Errorf("%d of %d batch queries failed", failed, total)
+	}
+	return output.String(), nil
+}
+
 // handleCommand processes a command and returns the output as a string
 func (c *Client) handleCommand(config *Config) (string, error) {
 	symbol := ""
@@ -456,6 +584,15 @@ func Run(config *Config) error {
 
 	// Create client
 	client := NewClient(conn, time.Duration(config.Timeout)*time.Second)
+
+	// Batch-file mode: the `batch` command reads complete query lines and
+	// runs each as an independent query of whatever command the line names.
+	// Output rules match the multi-symbol path above.
+	if config.Command == "batch" {
+		output, batchErr := client.runCommandLineBatch(config.Arguments)
+		fmt.Println(output)
+		return batchErr
+	}
 
 	// Batch mode: more than one positional argument on a symbol command runs
 	// every argument as an independent query. The combined sections always go

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"clangd-query/internal/client"
 	"clangd-query/internal/daemon"
@@ -110,6 +113,8 @@ Commands:
   hierarchy <symbol>...       Show type hierarchy
   signature <symbol>...       Show function signature
   interface <symbol>...       Show public interface
+  batch [file]                Run one query per input line (stdin or file);
+                              each line is a full command like "show Foo"
   logs                        Show daemon logs
   status                      Show daemon status
   shutdown                    Shutdown the daemon
@@ -125,7 +130,45 @@ Examples:
   clangd-query show GameScene::update
   clangd-query show GameObject Transform Renderer
   clangd-query usages src/main.cpp:42:15
-  clangd-query hierarchy BaseClass --limit 10`)
+  clangd-query hierarchy BaseClass --limit 10
+  clangd-query batch < queries.txt`)
+}
+
+// Reads batch query lines from standard input, or from a file when a path is
+// given. Blank lines and lines whose first non-whitespace character is '#' are
+// skipped so that generated query files can carry annotations without breaking
+// parsing.
+func readBatchLines(source string) ([]string, error) {
+	var reader io.Reader = os.Stdin
+	if source != "" && source != "-" {
+		file, err := os.Open(source)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		reader = file
+	}
+
+	// Long quoted symbols should not silently truncate, so the scanner buffer
+	// is raised well above the default 64 KB per-line limit.
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var lines []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read batch queries: %v", err)
+	}
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("batch mode requires at least one query line")
+	}
+	return lines, nil
 }
 
 func runDaemon(projectRoot string, verbose bool) {
@@ -187,7 +230,7 @@ func main() {
 
 	// Validate command
 	validCommands := []string{"search", "show", "view", "usages", "hierarchy",
-		"signature", "interface", "logs", "status", "shutdown"}
+		"signature", "interface", "batch", "logs", "status", "shutdown"}
 
 	if config.Command == "" {
 		fmt.Fprintf(os.Stderr, "Error: no command specified\n")
@@ -207,6 +250,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n", config.Command)
 		printHelp()
 		os.Exit(1)
+	}
+
+	// The batch command consumes its queries from standard input or from the
+	// optional file argument instead of taking them as positional arguments.
+	// Lines are read up front so that an empty or unreadable input fails fast
+	// before any daemon interaction happens.
+	if config.Command == "batch" {
+		source := ""
+		if len(config.Arguments) > 0 {
+			source = config.Arguments[0]
+		}
+		lines, err := readBatchLines(source)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		config.Arguments = lines
 	}
 
 	// Find project root

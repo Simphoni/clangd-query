@@ -141,6 +141,37 @@ func (tc *TestContext) RunCommandWithTimeout(args []string, timeout time.Duratio
 	}
 }
 
+// RunCommandWithStdin executes the clangd-query binary with the given arguments
+// and feeds the provided string to its standard input. It is used for commands
+// like `batch` that read their queries from stdin.
+func (tc *TestContext) RunCommandWithStdin(args []string, stdin string) *CommandResult {
+	cmd := exec.Command(tc.BinaryPath, args...)
+	cmd.Dir = tc.SampleProjectPath
+	cmd.Stdin = strings.NewReader(stdin)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			tc.T.Fatalf("Command failed: %v", err)
+		}
+		return &CommandResult{
+			Stdout:   stdout.String(),
+			Stderr:   stderr.String(),
+			ExitCode: exitErr.ExitCode(),
+		}
+	}
+	return &CommandResult{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: 0,
+	}
+}
+
 // AssertExitCode checks that the command exited with the expected code.
 func (tc *TestContext) AssertExitCode(result *CommandResult, expected int) {
 	if result.ExitCode != expected {
